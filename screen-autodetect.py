@@ -1,15 +1,20 @@
 import os
+import io
 import sys
 import time
-from time import sleep
 import threading
 import subprocess
 import socket
 import json
 import tkinter as tk
 import argparse
+from time import sleep
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Dict, List, Callable
+
+import win32clipboard as clp
+import win32con as con
+import ctypes
 
 # Ensure required modules are available.
 try:
@@ -28,7 +33,7 @@ except ImportError:
     raise ImportError("The 'pystray' module is required. Please install it using 'pip install pystray'.")
 
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageGrab
+    from PIL import Image, ImageTk
 except ImportError:
     raise ImportError("The 'Pillow' package is required. Please install it using 'pip install Pillow'.")
 
@@ -37,36 +42,60 @@ try:
 except ImportError:
     raise ImportError("The 'pythoncom' module (pywin32) is required. Please install it using 'pip install pywin32'.")
 
-if os.name == "nt":
+# ===============
+# CLIPBOARD UTILS
+# ===============
+CLP_FORMATS = {val: name for name, val in vars(clp).items() if name.startswith('CF_')}
+
+def format_name(fmt):
+    if fmt in CLP_FORMATS:
+        return CLP_FORMATS[fmt]
     try:
-        import win32clipboard
-        CLP_FORMATS = {val: name for name, val in vars(win32clipboard).items() if name.startswith('CF_')}
+        return clp.GetClipboardFormatName(fmt)
+    except:
+        return "unknown"
 
-        def format_name(fmt):
-            if fmt in CLP_FORMATS:
-                return CLP_FORMATS[fmt]
-            try:
-                return win32clipboard.GetClipboardFormatName(fmt)
-            except:
-                return "unknown"
+def get_available_formats():
+    clp.OpenClipboard()
+    
+    formats = []
+    fmt = 0
+    while True:
+        fmt = clp.EnumClipboardFormats(fmt)
+        if fmt == 0: break
+        formats.append(format_name(fmt))
 
-        def get_available_formats():
-            win32clipboard.OpenClipboard()
-            
-            formats = []
-            fmt = 0
-            while True:
-                fmt = win32clipboard.EnumClipboardFormats(fmt)
-                if fmt == 0: break
-                formats.append(format_name(fmt))
+    clp.CloseClipboard()
+    return formats
 
-            win32clipboard.CloseClipboard()
-            return formats
+def png_to_bmp_dib(png_bytes, keep_alpha=False):
+    """Convert raw PNG bytes → DIB byte string (header + pixels)."""
+    img = Image.open(io.BytesIO(png_bytes))
+    mode = "RGBA" if keep_alpha else "RGB"
+    with io.BytesIO() as tmp:
+        img.convert(mode).save(tmp, format="BMP")
+        bmp = tmp.getvalue()
+    return bmp[14:]
 
-    except ImportError:
-        print("The 'win32clipboard' module is not installed. Consider installing it for maximum clipboard compatibility.")
+def promote_png_to_dib():
+    png_fmt = clp.RegisterClipboardFormat("PNG")      # same call Barrier used
+    clp.OpenClipboard()
+    try:
+        if not clp.IsClipboardFormatAvailable(png_fmt):
+            raise RuntimeError("PNG format not on clipboard")
+        png_bytes = clp.GetClipboardData(png_fmt)     # <class 'bytes'>
+    finally:
+        clp.CloseClipboard()
 
+    dib_bytes = png_to_bmp_dib(png_bytes, keep_alpha=False)
 
+    clp.OpenClipboard()
+    try:
+        clp.EmptyClipboard()                          # optional – keeps things tidy
+        clp.SetClipboardData(con.CF_DIB, dib_bytes)   # pywin32 will alloc HGLOBAL
+        # If you need alpha, use con.CF_DIBV5 instead and keep_alpha=True
+    finally:
+        clp.CloseClipboard()
 
 # ========================
 # Configuration parameters
@@ -76,8 +105,8 @@ HOME = os.environ.get("USERPROFILE", "")
 CONFIG_FILE_NAME = "config.json"
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), CONFIG_FILE_NAME)
 BARRIER_HOME = os.path.join(HOME, "barrier")
-
 BARRIER_EXE = r"c:\program files\barrier\barriers.exe"
+ICON = "barrier_manager.png"
 
 if not os.path.exists(CONFIG_FILE):
     with open(CONFIG_FILE, "w") as f:
@@ -154,6 +183,7 @@ class BarrierManager:
         if self.status is None:
             self.log("Monitor configuration unrecognized; no Barrier started.")
             return
+        self.log("Starting Barrier...")
 
         if config_file is None:
             config_file = self.status["barr_config"]
@@ -162,14 +192,14 @@ class BarrierManager:
         barr_proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.PIPE)
         return barr_proc
 
-    def kill_barrier(self, threaded=False, report=True):
+    def kill_barrier(self, threaded=False, report=False):
         """Log the currently running Barrier processes."""
         if threaded:
             threading.Thread(target=self._kill_barrier, args=(report,), daemon=True).start()
         else:
             self._kill_barrier(report=report)
 
-    def _kill_barrier(self, report=True):
+    def _kill_barrier(self, report=False):
         """Kill all running Barrier processes."""
         self.log("Killing barrier processes...")
         for proc in psutil.process_iter(['name']):
@@ -177,11 +207,10 @@ class BarrierManager:
                 try:
                     proc.kill()
                 except Exception as e:
-                    if report:
-                        self.log("Failed to kill process:", e)
+                    self.log("Failed to kill process:", e)
+        self.log("Killed barrier processes")
         if report:
-            self.log("Killed barrier processes")
-            self.report_barrier_process_info(threaded=True)
+            self.report_barrier_process_info()
 
     def process_barrier_output(self):
         running = True
@@ -200,22 +229,23 @@ class BarrierManager:
 
     def try_fix_clipboard(self):
         if os.name == "nt" and "win32clipboard" in sys.modules:
-            import win32clipboard as clp
-
             avail_fmts = get_available_formats()
             clp.OpenClipboard()
-            if "CF_TEXT" in avail_fmts:
-                self.log("Fixing clipboard...")
-                data = clp.GetClipboardData(clp.CF_TEXT)
-                clp.EmptyClipboard()
-                clp.SetClipboardText(data, clp.CF_TEXT)
-            elif "CF_UNICODETEXT" in avail_fmts:
-                self.log("Fixing clipboard...")
-                data = clp.GetClipboardData(clp.CF_UNICODETEXT)
-                clp.EmptyClipboard()
-                clp.SetClipboardText(data, clp.CF_UNICODETEXT)
-
-            clp.CloseClipboard()
+            try:
+                if "CF_TEXT" in avail_fmts:
+                    self.log("Fixing clipboard for CF_TEXT...")
+                    data = clp.GetClipboardData(clp.CF_TEXT)
+                    clp.EmptyClipboard()
+                    clp.SetClipboardText(data, clp.CF_TEXT)
+                elif "CF_UNICODETEXT" in avail_fmts:
+                    self.log("Fixing clipboard for CF_UNICODETEXT...")
+                    data = clp.GetClipboardData(clp.CF_UNICODETEXT)
+                    clp.EmptyClipboard()
+                    clp.SetClipboardText(data, clp.CF_UNICODETEXT)
+            except Exception as e:
+                print(e.with_traceback(None))
+            finally:
+                clp.CloseClipboard()
 
     def address_available(self):
         """Check if any local interface has the specified IP address."""
@@ -275,8 +305,6 @@ class BarrierManager:
             self.kill_barrier()
             sleep(1)
             self.report_barrier_process_info()
-        else:
-            self.log("Starting Barrier...")
 
         # Choose configuration based on monitors.
         self.update() # update status and monitors
@@ -383,6 +411,11 @@ class BarrierApp:
     def __init__(self, root, show=False):
         self.root = root
         self.root.title("Barrier Monitor")
+        self.icon_path = os.path.join(os.path.dirname(__file__), ICON)
+
+        icon = self.create_image()
+        photo = ImageTk.PhotoImage(icon)
+        self.root.wm_iconphoto(False, photo)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Unmap>", lambda _: self.hide_window())
 
@@ -423,7 +456,7 @@ class BarrierApp:
 
         btn_processes = tk.Button(config_frame, text="Log Processes", width=20, command=lambda: self.barrier_manager.report_barrier_process_info(threaded=True))
         btn_processes.pack(pady=5)
-        btn_stop_processes = tk.Button(config_frame, text="Stop Processes", width=20, command=lambda: self.barrier_manager.kill_barrier(threaded=True))
+        btn_stop_processes = tk.Button(config_frame, text="Stop Processes", width=20, command=lambda: self.barrier_manager.kill_barrier(threaded=True, report=True))
         btn_stop_processes.pack(pady=5)
         btn_monitors = tk.Button(config_frame, text="Log Monitors", width=20, command=lambda: self.log("\n".join(self.barrier_manager.monitors)))
         btn_monitors.pack(pady=5)
@@ -506,7 +539,7 @@ class BarrierApp:
 
         def edit_config():
             config_path = os.path.join(BARRIER_HOME, selected_config.get())
-            subprocess.Popen(f"cmd /k nvim {config_path} && exit")
+            subprocess.Popen(f"wt new-tab nvim {config_path}")
 
         tk.Button(config_frame, text="Open Explorer", command=open_config_explorer).grid(row=1, column=2, padx=5, pady=5)
         tk.Button(config_frame, text="Edit", command=edit_config).grid(row=1, column=3, padx=5, pady=5)
@@ -580,7 +613,7 @@ class BarrierApp:
         name, _ = os.path.splitext(basename)
         script = os.path.join(path, f"{name}.py")
         self.log(f"Opening {script}...")
-        subprocess.Popen(f"cmd /k nvim {script} && exit")
+        subprocess.Popen(f"wt new-tab nvim {script}")
 
     def setup_tray_icon(self):
         image = self.create_image()
@@ -594,23 +627,26 @@ class BarrierApp:
 
     def create_image(self):
         # Create a 64x64 icon with a larger "B"
-        width = 64
-        height = 64
-        image = Image.new("RGB", (width, height), 0)
-        dc = ImageDraw.Draw(image)
-        text = "B"
-        
-        # Set a larger font size, try using a TrueType font.
-        font_size = 48
-        try:
-            # Use a common font - adjust path if needed.
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except IOError:
-            # Fallback to the default font if the TrueType font is not found.
-            font = ImageFont.load_default()
-        
-        text_width, text_height = dc.textsize(text, font=font)
-        dc.text(((width - text_width) / 2, (height - text_height) / 2), text, fill="white", font=font)
+        # width = 64
+        # height = 64
+        # image = Image.new("RGB", (width, height), 0)
+        # dc = ImageDraw.Draw(image)
+        # text = "B"
+        # 
+        # # Set a larger font size, try using a TrueType font.
+        # font_size = 48
+        # try:
+        #     # Use a common font - adjust path if needed.
+        #     font = ImageFont.truetype("arial.ttf", font_size)
+        # except IOError:
+        #     # Fallback to the default font if the TrueType font is not found.
+        #     font = ImageFont.load_default()
+        # 
+        # text_width, text_height = dc.textsize(text, font=font)
+        # dc.text(((width - text_width) / 2, (height - text_height) / 2), text, fill="white", font=font)
+
+        image = Image.open(self.icon_path)
+
         return image
 
 
@@ -622,8 +658,10 @@ class BarrierApp:
 # Main
 # ==========================
 def main(show=False):
+    myappid = "endoxide.barrier_manager"
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     root = tk.Tk()
-    app = BarrierApp(root, show=show)
+    BarrierApp(root, show=show)
     root.mainloop()
 
 if __name__ == "__main__":

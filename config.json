@@ -16,5 +16,22 @@
             "DISPLAY\\SAM7094\\5&3091cccb&0&UID8449_0"
         ],
         "barr_config": "C:\\Users\\matef\\barrier\\laptop-2.sgc"
+    },
+    {
+        "name": "mono-uni",
+        "monitors": [
+            "DISPLAY\\SAM0C1A\\5&10039ae3&0&UID4353_0",
+            "DISPLAY\\SAM0D20\\5&10039ae3&0&UID4352_0",
+            "DISPLAY\\SAM7094\\5&3091cccb&0&UID8449_0"
+        ],
+        "barr_config": "C:\\Users\\matef\\barrier\\laptop-1.sgc"
+    },
+    {
+        "name": "dual-uni",
+        "monitors": [
+            "DISPLAY\\SAM0D20\\5&10039ae3&0&UID4352_0",
+            "DISPLAY\\SAM7094\\5&3091cccb&0&UID8449_0"
+        ],
+        "barr_config": "C:\\Users\\matef\\barrier\\laptop-2.sgc"
     }
 ]

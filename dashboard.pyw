@@ -6,8 +6,9 @@ import threading
 import subprocess
 import socket
 import json
-import tkinter as tk
 import argparse
+import traceback
+import tkinter as tk
 from time import sleep
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Dict, List, Callable
@@ -15,6 +16,8 @@ from typing import Any, Dict, List, Callable
 import win32clipboard as clp
 import win32con as con
 import ctypes
+
+from remote_control import RemoteControlThread
 
 # Ensure required modules are available.
 try:
@@ -100,7 +103,8 @@ def promote_png_to_dib():
 # ========================
 # Configuration parameters
 # ========================
-ADDR = "192.168.2.1"
+HOST = "192.168.2.1"
+REMOTE_PORT = 1234
 HOME = os.environ.get("USERPROFILE", "")
 CONFIG_FILE_NAME = "config.json"
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), CONFIG_FILE_NAME)
@@ -188,8 +192,9 @@ class BarrierManager:
         if config_file is None:
             config_file = self.status["barr_config"]
 
-        cmd = [BARRIER_EXE, "-a", ADDR, "-c", config_file, "-n", "endoxide-pc", "--disable-crypto", "--no-tray"]
-        barr_proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.PIPE)
+        cmd = [BARRIER_EXE, "-a", HOST, "-c", config_file, "-n", "endoxide-pc", "--disable-crypto", "--no-tray"]
+        self.log(f"Running: {' '.join(cmd)}")
+        barr_proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return barr_proc
 
     def kill_barrier(self, threaded=False, report=False):
@@ -213,25 +218,32 @@ class BarrierManager:
             self.report_barrier_process_info()
 
     def process_barrier_output(self):
-        running = True
-        while running:
-            sleep(0.5)
-            if self.barr_proc:
-                for line in self.barr_proc.stdout or []: # blocking until EOF received
-                    line_str = line.decode().strip()
-                    self.log(line_str, target="barrier")
-                    if all(i in line_str for i in ("updated clipboard", "mLaptop")):
-                        self.try_fix_clipboard()
+            running = True
+            while running:
+                sleep(0.5)
+                try:
+                    if self.barr_proc:
+                        for line in self.barr_proc.stdout or []: # blocking until EOF received
+                            line_str = line.decode().strip()
+                            self.log(line_str, target=BarrierApp.LG_BARRIER)
+                            if all(i in line_str for i in ("updated clipboard 0", "mLaptop")):
+                                self.try_fix_clipboard()
 
-            # graceful handling to stop thread
-            with self.log_thread_lock:
-                running = self.log_thread_running
+                        for line in self.barr_proc.stderr or []: # blocking until EOF received
+                            line_str = line.decode().strip()
+                            self.log("[Error] ", line_str, target=BarrierApp.LG_BARRIER)
+
+                    # graceful handling to stop thread
+                    with self.log_thread_lock:
+                        running = self.log_thread_running
+                except Exception as e:
+                    self.log("[Error] Barrier log thread error caught: ", traceback.format_exception(type(e), e, e.__traceback__))
 
     def try_fix_clipboard(self):
         if os.name == "nt" and "win32clipboard" in sys.modules:
             avail_fmts = get_available_formats()
-            clp.OpenClipboard()
             try:
+                clp.OpenClipboard()
                 if "CF_TEXT" in avail_fmts:
                     self.log("Fixing clipboard for CF_TEXT...")
                     data = clp.GetClipboardData(clp.CF_TEXT)
@@ -243,7 +255,7 @@ class BarrierManager:
                     clp.EmptyClipboard()
                     clp.SetClipboardText(data, clp.CF_UNICODETEXT)
             except Exception as e:
-                print(e.with_traceback(None))
+                self.log(e.with_traceback(None))
             finally:
                 clp.CloseClipboard()
 
@@ -251,7 +263,7 @@ class BarrierManager:
         """Check if any local interface has the specified IP address."""
         for _, addrs in psutil.net_if_addrs().items():
             for addr in addrs:
-                if addr.family == socket.AF_INET and addr.address == ADDR:
+                if addr.family == socket.AF_INET and addr.address == HOST:
                     return True
         return False
 
@@ -328,29 +340,32 @@ class BarrierManager:
 
 
     def _monitor_loop(self):
-        address_available = self.address_available()
-        if address_available:
-            self.apply_barrier_change()
-        else:
-            self.log("Cannot bind to address")
-        running = True
-        while running:
-            time.sleep(1)
-
-            new_address_available = self.address_available()
-            if not new_address_available and address_available:
-                self.log("Cannot bind to address")
-                address_available = new_address_available
-                continue
-            new_monitors = self._get_monitors()
-            if new_address_available and self.monitors != new_monitors:
-                self.log("Monitor configuration changed.")
-                self.monitors = new_monitors
+        try:
+            address_available = self.address_available()
+            if address_available:
                 self.apply_barrier_change()
+            else:
+                self.log("Cannot bind to address")
+            running = True
+            while running:
+                time.sleep(1)
 
-            with self.monitor_running_lock:
-                if not self.monitor_running:
-                    running = False
+                new_address_available = self.address_available()
+                if not new_address_available and address_available:
+                    self.log("Cannot bind to address")
+                    address_available = new_address_available
+                    continue
+                new_monitors = self._get_monitors()
+                if new_address_available and self.monitors != new_monitors:
+                    self.log("Monitor configuration changed.")
+                    self.monitors = new_monitors
+                    self.apply_barrier_change()
+
+                with self.monitor_running_lock:
+                    if not self.monitor_running:
+                        running = False
+        except Exception as e:
+            self.log("[Error] Monitor loop thread crashed with esception: ", traceback.format_exception(type(e), e, e.__traceback__))
 
     def stop_monitor_loop(self):
         self.log("Cleaning up monitoring thread...")
@@ -406,7 +421,10 @@ class BarrierManager:
 # UI and System Tray Integration
 # ==========================
 class BarrierApp:
-    LOG_WINDOWS = ("manager", "barrier")
+    LG_MANAGER = "manager"
+    LG_BARRIER = "barrier"
+    LG_REMOTE = "remote control"
+    LOG_WINDOWS = (LG_MANAGER, LG_BARRIER, LG_REMOTE)
 
     def __init__(self, root, show=False):
         self.root = root
@@ -420,10 +438,14 @@ class BarrierApp:
         self.root.bind("<Unmap>", lambda _: self.hide_window())
 
         set_status_name = self.create_ui(root)
+
         self.barrier_manager = BarrierManager(self.log, set_status_name)
 
-        # Start the background monitoring thread.
-        self.barrier_manager.start_monitor_loop()
+        # Start the background threads
+        root.after(1, self.barrier_manager.start_monitor_loop)
+
+        self.remote_control = RemoteControlThread(host=HOST, port=REMOTE_PORT, log=lambda *args: self.log(*args, target=self.LG_REMOTE))
+        root.after(1, self.remote_control.start)
 
         # Setup system tray icon.
         self.icon = None
@@ -568,10 +590,13 @@ class BarrierApp:
         text = self._logs[target]
         message = ' '.join(map(str, args))
 
-        text.configure(state="normal")
-        text.insert(tk.END, f"{time.strftime('%H:%M:%S')} - {message}\n")
-        text.configure(state="disabled")
-        text.see(tk.END)
+        def do_log():
+            text.configure(state="normal")
+            text.insert(tk.END, f"{time.strftime('%H:%M:%S')} - {message}\n")
+            text.configure(state="disabled")
+            text.see(tk.END)
+
+        text.after(0, do_log)
 
     def clear_log(self, target: str | None = None):
         if target is None:
@@ -594,6 +619,7 @@ class BarrierApp:
 
     def on_quit(self):
         self.barrier_manager.cleanup()
+        self.remote_control.shutdown()
         if self.icon:
             print("destroying icon")
             self.icon.stop()
@@ -626,25 +652,6 @@ class BarrierApp:
         threading.Thread(target=self.icon.run, daemon=True).start()
 
     def create_image(self):
-        # Create a 64x64 icon with a larger "B"
-        # width = 64
-        # height = 64
-        # image = Image.new("RGB", (width, height), 0)
-        # dc = ImageDraw.Draw(image)
-        # text = "B"
-        # 
-        # # Set a larger font size, try using a TrueType font.
-        # font_size = 48
-        # try:
-        #     # Use a common font - adjust path if needed.
-        #     font = ImageFont.truetype("arial.ttf", font_size)
-        # except IOError:
-        #     # Fallback to the default font if the TrueType font is not found.
-        #     font = ImageFont.load_default()
-        # 
-        # text_width, text_height = dc.textsize(text, font=font)
-        # dc.text(((width - text_width) / 2, (height - text_height) / 2), text, fill="white", font=font)
-
         image = Image.open(self.icon_path)
 
         return image

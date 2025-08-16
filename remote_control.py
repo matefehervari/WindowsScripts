@@ -22,8 +22,10 @@ platform = os.name
 
 if platform == "nt":
     import win32clipboard as clp
+    import winotify
 else:
     clp = SimpleNamespace()
+    winotify = SimpleNamespace()
 
 
 
@@ -64,6 +66,8 @@ class CustomLogHandler(logging.Handler):
 class RemoteControlThread(threading.Thread):
     def __init__(self, host=HOST, port=PORT, log: Callable[..., None]=print):
         threading.Thread.__init__(self)
+        self.host = host
+        self.port = port
         self.daemon = True  # Thread will shut down with main program
         self.log = log
 
@@ -71,17 +75,20 @@ class RemoteControlThread(threading.Thread):
         self.log_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
 
         # Create Flask App
+        print("[Remote Control] Creating flask app...")
         self.app = Flask("Remote control")
+        print("[Remote Control] Creating CORS app...")
         CORS(self.app)
+        print("[Remote Control] Setting up routes...")
         self.setup_routes()
 
         # Attach the handler to Flask's logger
+        print("[Remote Control] Adding log handler...")
         self.app.logger.addHandler(self.log_handler)
 
         # Lower Flask's built-in logging level
         self.app.logger.setLevel(logging.INFO)
 
-        self.server = make_server(host, port, self.app)
         self.ctx = self.app.app_context()
 
 
@@ -101,6 +108,11 @@ class RemoteControlThread(threading.Thread):
                     
                     if platform == "nt":
                         copy_image_to_clipboard(image)
+                        png_notif = winotify.Notification(app_id="Remote Control",
+                                                               title="Clipboard Updated",
+                                                               msg="Detected base64 open-browser action URL. The PNG image has been successfully copied.", 
+                                                               )
+                        png_notif.show()
                         return jsonify({"status": "image copied to clipboard"}), 200
                     elif platform == "posix":
                         return jsonify({"status": "image copy not yet supported"}), 200
@@ -119,6 +131,9 @@ class RemoteControlThread(threading.Thread):
 
     def run(self):
         try:
+            print("[Remote Control] Creating server...")
+            self.log("Creating flask server...")
+            self.server = make_server(self.host, self.port, self.app)
             self.log("Flask server starting...")
             self.ctx.push()
             with Capturing() as output:

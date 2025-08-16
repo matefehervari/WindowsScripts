@@ -104,6 +104,7 @@ def promote_png_to_dib():
 # Configuration parameters
 # ========================
 HOST = "192.168.2.1"
+# HOST = "192.168.1.10"
 REMOTE_PORT = 1234
 HOME = os.environ.get("USERPROFILE", "")
 CONFIG_FILE_NAME = "config.json"
@@ -433,20 +434,25 @@ class BarrierApp:
 
         icon = self.create_image()
         photo = ImageTk.PhotoImage(icon)
+        print("Setting protocols...")
         self.root.wm_iconphoto(False, photo)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Unmap>", lambda _: self.hide_window())
 
         set_status_name = self.create_ui(root)
 
+        print("Creating barrier manager...")
         self.barrier_manager = BarrierManager(self.log, set_status_name)
 
+        print("Starting monitor loop...")
         # Start the background threads
         root.after(1, self.barrier_manager.start_monitor_loop)
 
+        print("Starting remote control...")
         self.remote_control = RemoteControlThread(host=HOST, port=REMOTE_PORT, log=lambda *args: self.log(*args, target=self.LG_REMOTE))
         root.after(1, self.remote_control.start)
 
+        print("Setting tray icon...")
         # Setup system tray icon.
         self.icon = None
         self.setup_tray_icon()
@@ -645,6 +651,8 @@ class BarrierApp:
         image = self.create_image()
         menu = pystray.Menu(
             pystray.MenuItem("Show", self.show_window, default=True),
+            pystray.MenuItem("Restart Barrier", self.restart_detected),
+            pystray.MenuItem("Restart", self.on_restart),
             pystray.MenuItem("Quit", self.on_quit)
         )
         # Pass the on_click callback to handle left-click events.
@@ -659,7 +667,7 @@ class BarrierApp:
 
     def restart_detected(self):
         """Force a restart using auto-detected monitor configuration in a separate thread."""
-        threading.Thread(target=self.barrier_manager.apply_barrier_change, daemon=True).start()
+        threading.Thread(target=self.barrier_manager.apply_barrier_change, args=(True,), daemon=True).start()
 
 # ==========================
 # Main
